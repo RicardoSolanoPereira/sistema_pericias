@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+.env.*
+
+# Local DB / data
+data/*.db
+data/*.sqlite*
+*.db
+*.sqlite*
+
+# Logs / outputs
+logs/
+exports/
+uploads/
+
+# Streamlit cache/config (se usar)
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
