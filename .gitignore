@@ -13,11 +13,13 @@ env/
 .env
 .env.*
 
-# Local DB / data
-data/*.db
-data/*.sqlite*
+# Banco local e backups
+data/
+backups/
 *.db
-*.sqlite*
+*.sqlite
+*.sqlite3
+logs/
 
 # Logs / outputs
 logs/
