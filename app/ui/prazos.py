@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import select
 
@@ -26,10 +26,29 @@ def _semaforo(dias: int) -> str:
     return "🟢 Ok"
 
 
+def _filtro_aplica(dias_restantes: int, filtro: str) -> bool:
+    """Filtro estrito em data SP (dias restantes calculados em SP)."""
+    if filtro == "Abertos (todos)":
+        return True
+    if filtro == "Atrasados":
+        return dias_restantes < 0
+    if filtro == "Vencem em 7 dias":
+        return 0 <= dias_restantes <= 7
+    if filtro == "Vencem em 15 dias":
+        return 0 <= dias_restantes <= 15
+    if filtro == "Vencem em 30 dias":
+        return 0 <= dias_restantes <= 30
+    return True
+
+
 def render(owner_user_id: int):
     st.header("⏰ Prazos")
 
-    # Carrega processos do usuário
+    hoje_sp = now_br().date()
+
+    # -------------------------
+    # Processos do usuário
+    # -------------------------
     with get_session() as s:
         processos = (
             s.execute(
@@ -45,7 +64,6 @@ def render(owner_user_id: int):
         st.info("Cadastre um processo primeiro.")
         return
 
-    # ✅ Aqui: label do processo com número + tipo de ação
     proc_labels = [
         f"[{p.id}] {p.numero_processo} – {p.tipo_acao or 'Sem tipo de ação'}"
         for p in processos
@@ -53,7 +71,7 @@ def render(owner_user_id: int):
     label_to_id = {proc_labels[i]: processos[i].id for i in range(len(processos))}
 
     # -------------------------
-    # Criar prazo
+    # Novo prazo
     # -------------------------
     st.subheader("➕ Novo prazo")
     with st.form("form_prazo_create", clear_on_submit=True):
@@ -63,7 +81,7 @@ def render(owner_user_id: int):
         c1, c2, c3 = st.columns(3)
         evento = c1.text_input("Evento *", key="prazo_create_evento")
         data_lim = c2.date_input(
-            "Data limite *", value=date.today(), key="prazo_create_data"
+            "Data limite *", value=hoje_sp, key="prazo_create_data"
         )
         prioridade = c3.selectbox(
             "Prioridade", ["Baixa", "Média", "Alta"], index=1, key="prazo_create_prio"
@@ -74,9 +92,7 @@ def render(owner_user_id: int):
 
     if ok:
         try:
-            # ✅ Aqui: converte date -> datetime no fuso Brasil
-            dt_lim = date_to_br_datetime(data_lim)
-
+            dt_lim = date_to_br_datetime(data_lim)  # SP 00:00
             with get_session() as s:
                 PrazosService.create(
                     s,
@@ -97,11 +113,26 @@ def render(owner_user_id: int):
     st.divider()
 
     # -------------------------
-    # Listar prazos abertos
+    # Listagem + filtros
     # -------------------------
     st.subheader("📋 Prazos (abertos)")
-    filtro_proc = st.selectbox(
-        "Filtrar por processo", ["(Todos)"] + proc_labels, key="prazo_list_filter_proc"
+
+    cfil1, cfil2 = st.columns([2, 2])
+    filtro_proc = cfil1.selectbox(
+        "Filtrar por processo",
+        ["(Todos)"] + proc_labels,
+        key="prazo_list_filter_proc",
+    )
+    filtro_tipo = cfil2.selectbox(
+        "Filtro de vencimento",
+        [
+            "Abertos (todos)",
+            "Atrasados",
+            "Vencem em 7 dias",
+            "Vencem em 15 dias",
+            "Vencem em 30 dias",
+        ],
+        key="prazo_list_filter_tipo",
     )
 
     data = []
@@ -111,7 +142,9 @@ def render(owner_user_id: int):
             rows = PrazosService.list_all(s, owner_user_id, only_open=True)
             for prazo, proc in rows:
                 dias = _dias_restantes(prazo.data_limite)
-                # ✅ Aqui: mostra processo + tipo de ação
+                if not _filtro_aplica(dias, filtro_tipo):
+                    continue
+
                 proc_txt = (
                     f"{proc.numero_processo} – {proc.tipo_acao or 'Sem tipo de ação'}"
                 )
@@ -120,7 +153,6 @@ def render(owner_user_id: int):
                         "prazo_id": prazo.id,
                         "processo": proc_txt,
                         "evento": prazo.evento,
-                        # ✅ Aqui: data em padrão BR
                         "data_limite": format_date_br(prazo.data_limite),
                         "dias_restantes": dias,
                         "status": _semaforo(dias),
@@ -138,6 +170,9 @@ def render(owner_user_id: int):
 
             for prazo in prazos:
                 dias = _dias_restantes(prazo.data_limite)
+                if not _filtro_aplica(dias, filtro_tipo):
+                    continue
+
                 data.append(
                     {
                         "prazo_id": prazo.id,
@@ -151,10 +186,12 @@ def render(owner_user_id: int):
                 )
 
     if not data:
-        st.info("Nenhum prazo aberto.")
+        st.info("Nenhum prazo aberto com os filtros selecionados.")
         return
 
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(data).sort_values(
+        by=["dias_restantes", "data_limite"], ascending=[True, True]
+    )
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
@@ -179,14 +216,11 @@ def render(owner_user_id: int):
         evento_e = c1.text_input(
             "Evento", value=pz.evento, key=f"prazo_edit_evento_{prazo_id}"
         )
-
-        # ✅ Aqui: exibimos o date_input como date (BR), mantendo base no fuso
         data_e = c2.date_input(
             "Data limite",
             value=ensure_br(pz.data_limite).date(),
             key=f"prazo_edit_data_{prazo_id}",
         )
-
         prio_e = c3.selectbox(
             "Prioridade",
             ["Baixa", "Média", "Alta"],
@@ -214,7 +248,6 @@ def render(owner_user_id: int):
                     int(prazo_id),
                     PrazoUpdate(
                         evento=evento_e,
-                        # ✅ Aqui: salva no fuso Brasil
                         data_limite=date_to_br_datetime(data_e),
                         prioridade=prio_e,
                         concluido=concl,
