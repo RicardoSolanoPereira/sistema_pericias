@@ -28,10 +28,10 @@ Arquitetura modular com separação de:
 ## Roadmap
 
 - [x] CRUD de Processos
-- [ ] CRUD de Prazos
+- [x] CRUD de Prazos
 - [ ] Andamentos
 - [ ] Financeiro completo
-- [ ] Alertas por e-mail
+- [x] Alertas por e-mail
 - [ ] Dashboard avançado
 - [ ] Migração para PostgreSQL
 - [ ] Versão SaaS futura

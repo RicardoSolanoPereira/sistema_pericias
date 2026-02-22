@@ -3,11 +3,12 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.sqlite3
 
 # Virtualenv
-.venv/
 venv/
-env/
+.env/
+.venv/
 
 # Env / secrets
 .env
@@ -20,6 +21,9 @@ backups/
 *.sqlite
 *.sqlite3
 logs/
+
+# VSCode
+.vscode/
 
 # Logs / outputs
 logs/

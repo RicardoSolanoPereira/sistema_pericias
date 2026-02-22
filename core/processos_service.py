@@ -113,9 +113,11 @@ class ProcessosService:
 
     @staticmethod
     def delete(session: Session, owner_user_id: int, processo_id: int) -> None:
-        session.execute(
-            delete(Processo).where(
-                Processo.id == processo_id, Processo.owner_user_id == owner_user_id
-            )
-        )
+        proc = ProcessosService.get(session, owner_user_id, processo_id)
+        if not proc:
+            raise ValueError("Processo não encontrado")
+
+        session.delete(
+            proc
+        )  # ✅ dispara cascade ORM (prazos/andamentos/agenda/financeiro)
         session.commit()
