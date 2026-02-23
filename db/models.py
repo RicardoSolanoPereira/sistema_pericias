@@ -228,3 +228,23 @@ class LancamentoFinanceiro(Base):
     )
 
     processo: Mapped["Processo"] = relationship(back_populates="lancamentos")
+
+
+# ------------------------------------------------------------
+# CALENDÁRIO / FERIADOS
+# ------------------------------------------------------------
+class Feriado(Base):
+    __tablename__ = "feriados"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    data: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+
+    # NACIONAL | ESTADUAL_SP | MUNICIPAL_ILHABELA | TJSP
+    escopo: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    # opcional: usar para suspensões específicas
+    comarca: Mapped[str | None] = mapped_column(String(120))
+
+    descricao: Mapped[str | None] = mapped_column(String(180))
+    fonte: Mapped[str | None] = mapped_column(String(300))

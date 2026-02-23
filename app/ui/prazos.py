@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
+from datetime import datetime, timedelta, date
 
 from sqlalchemy import select
 
@@ -8,6 +8,16 @@ from db.connection import get_session
 from db.models import Processo
 from core.prazos_service import PrazosService, PrazoCreate, PrazoUpdate
 from core.utils import now_br, ensure_br, format_date_br, date_to_br_datetime
+from app.ui.theme import inject_global_css
+
+
+TIPOS_TRABALHO = (
+    "Perito Judicial",
+    "Assistente Técnico",
+    "Trabalho Particular",
+)
+
+PRIORIDADES = ("Baixa", "Média", "Alta")
 
 
 def _dias_restantes(dt: datetime) -> int:
@@ -26,30 +36,38 @@ def _semaforo(dias: int) -> str:
     return "🟢 Ok"
 
 
-def _filtro_aplica_abertos(dias_restantes: int, filtro: str) -> bool:
-    if filtro == "Abertos (todos)":
-        return True
-    if filtro == "Atrasados":
-        return dias_restantes < 0
-    if filtro == "Vencem em 7 dias":
-        return 0 <= dias_restantes <= 7
-    if filtro == "Vencem em 15 dias":
-        return 0 <= dias_restantes <= 15
-    if filtro == "Vencem em 30 dias":
-        return 0 <= dias_restantes <= 30
-    return True
+def _proc_label(p: Processo) -> str:
+    tipo = (p.tipo_acao or "").strip()
+    papel = (p.papel or "").strip()
+    base = f"[{p.id}] {p.numero_processo}"
+    if tipo:
+        base += f" – {tipo}"
+    if papel:
+        base += f"  •  {papel}"
+    return base
 
 
-def render(owner_user_id: int):
-    st.header("⏰ Prazos")
+def _filter_text(prazo, proc) -> str:
+    # Campo texto para busca (tudo minúsculo)
+    return " ".join(
+        [
+            str(proc.numero_processo or ""),
+            str(proc.tipo_acao or ""),
+            str(proc.comarca or ""),
+            str(proc.vara or ""),
+            str(proc.contratante or ""),
+            str(proc.papel or ""),
+            str(prazo.evento or ""),
+            str(prazo.origem or ""),
+            str(prazo.referencia or ""),
+            str(prazo.observacoes or ""),
+        ]
+    ).lower()
 
-    hoje_sp = now_br().date()
 
-    # -------------------------
-    # Processos do usuário
-    # -------------------------
+def _load_processos(owner_user_id: int) -> list[Processo]:
     with get_session() as s:
-        processos = (
+        return (
             s.execute(
                 select(Processo)
                 .where(Processo.owner_user_id == owner_user_id)
@@ -59,320 +77,448 @@ def render(owner_user_id: int):
             .all()
         )
 
+
+def render(owner_user_id: int):
+    inject_global_css()
+    st.header("⏰ Prazos")
+    hoje_sp = now_br().date()
+
+    # -------------------------
+    # Processos do usuário
+    # -------------------------
+    processos = _load_processos(owner_user_id)
+
     if not processos:
         st.info("Cadastre um processo primeiro.")
         return
 
-    proc_labels = [
-        f"[{p.id}] {p.numero_processo} – {p.tipo_acao or 'Sem tipo de ação'}"
-        for p in processos
-    ]
+    proc_labels = [_proc_label(p) for p in processos]
     label_to_id = {proc_labels[i]: processos[i].id for i in range(len(processos))}
+    proc_by_id = {p.id: p for p in processos}
 
     # -------------------------
-    # Novo prazo
+    # Novo prazo (com origem / referência)
     # -------------------------
-    st.subheader("➕ Novo prazo")
-    with st.form("form_prazo_create", clear_on_submit=True):
-        sel = st.selectbox("Processo", proc_labels, key="prazo_create_proc")
-        processo_id = label_to_id[sel]
+    with st.expander("➕ Novo prazo", expanded=True):
+        with st.form("form_prazo_create", clear_on_submit=True):
+            sel = st.selectbox("Processo *", proc_labels, key="prazo_create_proc")
+            processo_id = int(label_to_id[sel])
 
-        c1, c2, c3 = st.columns(3)
-        evento = c1.text_input("Evento *", key="prazo_create_evento")
-        data_lim = c2.date_input(
-            "Data limite *", value=hoje_sp, key="prazo_create_data"
-        )
-        prioridade = c3.selectbox(
-            "Prioridade", ["Baixa", "Média", "Alta"], index=1, key="prazo_create_prio"
-        )
+            c1, c2, c3 = st.columns(3)
+            evento = c1.text_input("Evento *", key="prazo_create_evento")
+            data_lim = c2.date_input(
+                "Data limite *", value=hoje_sp, key="prazo_create_data"
+            )
+            prioridade = c3.selectbox(
+                "Prioridade", list(PRIORIDADES), index=1, key="prazo_create_prio"
+            )
 
-        obs = st.text_area("Observações", key="prazo_create_obs")
-        ok = st.form_submit_button("Salvar prazo", type="primary")
+            c4, c5 = st.columns(2)
+            origem = c4.selectbox(
+                "Origem (opcional)",
+                [
+                    "",
+                    "e-SAJ/TJ",
+                    "Diário Oficial",
+                    "E-mail",
+                    "Cliente/Contratante",
+                    "Outro",
+                ],
+                index=0,
+                key="prazo_create_origem",
+            )
+            referencia = c5.text_input(
+                "Referência (opcional)",
+                placeholder="Ex.: fls. 389 / ID 12345 / mov. 12.1",
+                key="prazo_create_ref",
+            )
 
-    if ok:
-        try:
-            dt_lim = date_to_br_datetime(data_lim)
-            with get_session() as s:
-                PrazosService.create(
-                    s,
-                    owner_user_id,
-                    PrazoCreate(
-                        processo_id=int(processo_id),
-                        evento=evento,
-                        data_limite=dt_lim,
-                        prioridade=prioridade,
-                        observacoes=obs,
-                    ),
-                )
-            st.success("Prazo criado.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Erro ao criar prazo: {e}")
+            obs = st.text_area("Observações", key="prazo_create_obs")
+            ok = st.form_submit_button("Salvar prazo", type="primary")
+
+        if ok:
+            try:
+                dt_lim = date_to_br_datetime(data_lim)
+                with get_session() as s:
+                    PrazosService.create(
+                        s,
+                        owner_user_id,
+                        PrazoCreate(
+                            processo_id=int(processo_id),
+                            evento=evento,
+                            data_limite=dt_lim,
+                            prioridade=prioridade,
+                            origem=(origem or None),
+                            referencia=(referencia.strip() or None),
+                            observacoes=obs,
+                        ),
+                    )
+                st.success("Prazo criado.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erro ao criar prazo: {e}")
 
     st.divider()
 
     # -------------------------
-    # Abas: Abertos x Concluídos
+    # Filtros globais (valem para todas as tabs)
     # -------------------------
-    tab_abertos, tab_conc = st.tabs(["📋 Abertos", "✅ Concluídos"])
-
-    # =========================================================
-    # TAB ABERTOS
-    # =========================================================
-    with tab_abertos:
-        st.subheader("📋 Prazos (abertos)")
-
-        cfil1, cfil2 = st.columns([2, 2])
-        filtro_proc = cfil1.selectbox(
-            "Filtrar por processo",
-            ["(Todos)"] + proc_labels,
-            key="prazo_open_filter_proc",
+    cF1, cF2, cF3 = st.columns([2, 2, 6])
+    filtro_tipo = cF1.selectbox(
+        "Tipo de Trabalho",
+        ["(Todos)"] + list(TIPOS_TRABALHO),
+        index=0,
+        key="prazo_filtro_tipo_trabalho",
+    )
+    filtro_proc = cF2.selectbox(
+        "Processo",
+        ["(Todos)"] + proc_labels,
+        index=0,
+        key="prazo_filtro_proc_global",
+    )
+    busca = (
+        cF3.text_input(
+            "Buscar (processo, evento, origem, referência, observações)",
+            value="",
+            key="prazo_busca_global",
         )
-        filtro_tipo = cfil2.selectbox(
-            "Filtro de vencimento",
-            [
-                "Abertos (todos)",
-                "Atrasados",
-                "Vencem em 7 dias",
-                "Vencem em 15 dias",
-                "Vencem em 30 dias",
-            ],
-            key="prazo_open_filter_tipo",
-        )
+        .strip()
+        .lower()
+    )
 
+    tipo_val = None if filtro_tipo == "(Todos)" else filtro_tipo
+    processo_id_val = (
+        None if filtro_proc == "(Todos)" else int(label_to_id[filtro_proc])
+    )
+
+    # -------------------------
+    # Carregar dados base (abertos e concluídos) uma vez
+    # sem alterar services: usamos list_all e filtramos em Python
+    # -------------------------
+    with get_session() as s:
+        rows_all = PrazosService.list_all(
+            s, owner_user_id, only_open=False
+        )  # list[(Prazo, Processo)]
+
+    # aplica filtros globais em memória
+    filtered = []
+    for prazo, proc in rows_all:
+        if tipo_val and (proc.papel or "").strip() != tipo_val:
+            continue
+        if processo_id_val and int(proc.id) != int(processo_id_val):
+            continue
+        if busca and busca not in _filter_text(prazo, proc):
+            continue
+        filtered.append((prazo, proc))
+
+    # -------------------------
+    # Tabs: atrasados, 7 dias, abertos, concluídos
+    # -------------------------
+    tab_atras, tab_7d, tab_abertos, tab_conc = st.tabs(
+        ["🔴 Atrasados", "🟠 Vencem (7 dias)", "📋 Abertos", "✅ Concluídos"]
+    )
+
+    # Helpers para montar dataframe
+    def build_df(items, include_status=True, include_dias=True):
         data = []
-
-        with get_session() as s:
-            if filtro_proc == "(Todos)":
-                rows = PrazosService.list_all(s, owner_user_id, only_open=True)
-                for prazo, proc in rows:
-                    dias = _dias_restantes(prazo.data_limite)
-                    if not _filtro_aplica_abertos(dias, filtro_tipo):
-                        continue
-
-                    proc_txt = f"{proc.numero_processo} – {proc.tipo_acao or 'Sem tipo de ação'}"
-                    data.append(
-                        {
-                            "prazo_id": prazo.id,
-                            "processo": proc_txt,
-                            "evento": prazo.evento,
-                            "data_limite": format_date_br(prazo.data_limite),
-                            "dias_restantes": dias,
-                            "status": _semaforo(dias),
-                            "prioridade": prazo.prioridade,
-                        }
-                    )
-            else:
-                pid = label_to_id[filtro_proc]
-                prazos = PrazosService.list_by_processo(
-                    s, owner_user_id, pid, only_open=True
-                )
-
-                proc_obj = next(p for p in processos if p.id == pid)
-                proc_txt = f"{proc_obj.numero_processo} – {proc_obj.tipo_acao or 'Sem tipo de ação'}"
-
-                for prazo in prazos:
-                    dias = _dias_restantes(prazo.data_limite)
-                    if not _filtro_aplica_abertos(dias, filtro_tipo):
-                        continue
-
-                    data.append(
-                        {
-                            "prazo_id": prazo.id,
-                            "processo": proc_txt,
-                            "evento": prazo.evento,
-                            "data_limite": format_date_br(prazo.data_limite),
-                            "dias_restantes": dias,
-                            "status": _semaforo(dias),
-                            "prioridade": prazo.prioridade,
-                        }
-                    )
+        for prazo, proc in items:
+            dias = _dias_restantes(prazo.data_limite)
+            row = {
+                "prazo_id": int(prazo.id),
+                "processo": f"{proc.numero_processo} – {proc.tipo_acao or 'Sem tipo de ação'}",
+                "evento": prazo.evento,
+                "data_limite": format_date_br(prazo.data_limite),
+                "prioridade": prazo.prioridade,
+                "origem": (prazo.origem or ""),
+                "referência": (prazo.referencia or ""),
+            }
+            if include_dias:
+                row["dias_restantes"] = int(dias)
+            if include_status:
+                row["status"] = _semaforo(dias)
+            data.append(row)
 
         if not data:
-            st.info("Nenhum prazo aberto com os filtros selecionados.")
+            return None
+
+        df = pd.DataFrame(data)
+        if "dias_restantes" in df.columns:
+            df = df.sort_values(by=["dias_restantes"], ascending=True)
         else:
-            df = pd.DataFrame(data).sort_values(by=["dias_restantes"], ascending=[True])
+            df = df.sort_values(by=["data_limite"], ascending=False)
+        return df
+
+    # -------------------------
+    # TAB: Atrasados (abertos e dias < 0)
+    # -------------------------
+    with tab_atras:
+        st.subheader("🔴 Prazos atrasados")
+        items = []
+        for prazo, proc in filtered:
+            if bool(prazo.concluido):
+                continue
+            dias = _dias_restantes(prazo.data_limite)
+            if dias < 0:
+                items.append((prazo, proc))
+
+        df = build_df(items, include_status=True, include_dias=True)
+        if df is None:
+            st.info("Nenhum prazo atrasado com os filtros atuais.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("⚡ Ações rápidas (Atrasados)")
+            _acoes_rapidas_prazos(df)
+
+    # -------------------------
+    # TAB: Vencem em 7 dias (abertos e 0..7)
+    # -------------------------
+    with tab_7d:
+        st.subheader("🟠 Prazos vencendo em até 7 dias")
+        items = []
+        for prazo, proc in filtered:
+            if bool(prazo.concluido):
+                continue
+            dias = _dias_restantes(prazo.data_limite)
+            if 0 <= dias <= 7:
+                items.append((prazo, proc))
+
+        df = build_df(items, include_status=True, include_dias=True)
+        if df is None:
+            st.info("Nenhum prazo vencendo em até 7 dias com os filtros atuais.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("⚡ Ações rápidas (7 dias)")
+            _acoes_rapidas_prazos(df)
+
+    # -------------------------
+    # TAB: Abertos (todos)
+    # -------------------------
+    with tab_abertos:
+        st.subheader("📋 Prazos abertos (todos)")
+
+        c1, c2 = st.columns([2, 4])
+        filtro_janela = c1.selectbox(
+            "Janela",
+            ["Todos", "Atrasados", "0–7 dias", "0–15 dias", "0–30 dias"],
+            index=0,
+            key="prazo_open_window",
+        )
+        ordem = c2.selectbox(
+            "Ordenar",
+            ["Mais urgentes primeiro", "Mais distantes primeiro"],
+            index=0,
+            key="prazo_open_order",
+        )
+
+        items = []
+        for prazo, proc in filtered:
+            if bool(prazo.concluido):
+                continue
+            dias = _dias_restantes(prazo.data_limite)
+
+            if filtro_janela == "Atrasados" and not (dias < 0):
+                continue
+            if filtro_janela == "0–7 dias" and not (0 <= dias <= 7):
+                continue
+            if filtro_janela == "0–15 dias" and not (0 <= dias <= 15):
+                continue
+            if filtro_janela == "0–30 dias" and not (0 <= dias <= 30):
+                continue
+
+            items.append((prazo, proc))
+
+        df = build_df(items, include_status=True, include_dias=True)
+        if df is None:
+            st.info("Nenhum prazo aberto com os filtros atuais.")
+        else:
+            df = df.sort_values(
+                by=["dias_restantes"], ascending=(ordem == "Mais urgentes primeiro")
+            )
             st.dataframe(df, use_container_width=True, hide_index=True)
 
             st.divider()
             st.subheader("✏️ Editar / ✅ Concluir / 🗑️ Excluir (Abertos)")
-            prazo_id = st.selectbox(
-                "Selecione o prazo_id",
-                df["prazo_id"].tolist(),
-                key="prazo_open_edit_select",
-            )
+            _editar_excluir_prazo(df, owner_user_id)
 
-            with get_session() as s:
-                pz = PrazosService.get(s, owner_user_id, int(prazo_id))
-
-            if not pz:
-                st.error("Prazo não encontrado.")
-            else:
-                with st.form(f"form_prazo_open_edit_{prazo_id}"):
-                    c1, c2, c3 = st.columns(3)
-                    evento_e = c1.text_input(
-                        "Evento", value=pz.evento, key=f"prazo_open_evento_{prazo_id}"
-                    )
-                    data_e = c2.date_input(
-                        "Data limite",
-                        value=ensure_br(pz.data_limite).date(),
-                        key=f"prazo_open_data_{prazo_id}",
-                    )
-                    prio_e = c3.selectbox(
-                        "Prioridade",
-                        ["Baixa", "Média", "Alta"],
-                        index=["Baixa", "Média", "Alta"].index(pz.prioridade),
-                        key=f"prazo_open_prio_{prazo_id}",
-                    )
-
-                    concl = st.checkbox(
-                        "Concluído",
-                        value=bool(pz.concluido),
-                        key=f"prazo_open_conc_{prazo_id}",
-                    )
-                    obs_e = st.text_area(
-                        "Observações",
-                        value=pz.observacoes or "",
-                        key=f"prazo_open_obs_{prazo_id}",
-                    )
-
-                    b1, b2 = st.columns(2)
-                    salvar = b1.form_submit_button("Salvar alterações", type="primary")
-                    excluir = b2.form_submit_button("Excluir")
-
-                if salvar:
-                    try:
-                        with get_session() as s:
-                            PrazosService.update(
-                                s,
-                                owner_user_id,
-                                int(prazo_id),
-                                PrazoUpdate(
-                                    evento=evento_e,
-                                    data_limite=date_to_br_datetime(data_e),
-                                    prioridade=prio_e,
-                                    concluido=concl,
-                                    observacoes=obs_e,
-                                ),
-                            )
-                        st.success("Prazo atualizado.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao salvar: {e}")
-
-                if excluir:
-                    try:
-                        with get_session() as s:
-                            PrazosService.delete(s, owner_user_id, int(prazo_id))
-                        st.warning("Prazo excluído.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao excluir: {e}")
-
-    # =========================================================
-    # TAB CONCLUÍDOS
-    # =========================================================
+    # -------------------------
+    # TAB: Concluídos
+    # -------------------------
     with tab_conc:
         st.subheader("✅ Prazos concluídos")
 
-        c1, c2 = st.columns([2, 2])
-        filtro_proc_c = c1.selectbox(
-            "Filtrar por processo",
-            ["(Todos)"] + proc_labels,
-            key="prazo_done_filter_proc",
-        )
-        busca = c2.text_input("Buscar no evento/observações", key="prazo_done_search")
+        items = [(prazo, proc) for prazo, proc in filtered if bool(prazo.concluido)]
 
-        data_c = []
-
-        with get_session() as s:
-            if filtro_proc_c == "(Todos)":
-                rows = PrazosService.list_all(s, owner_user_id, only_open=False)
-                for prazo, proc in rows:
-                    proc_txt = f"{proc.numero_processo} – {proc.tipo_acao or 'Sem tipo de ação'}"
-                    txt = f"{prazo.evento} {(prazo.observacoes or '')}".lower()
-                    if busca and busca.lower() not in txt:
-                        continue
-
-                    data_c.append(
-                        {
-                            "prazo_id": prazo.id,
-                            "processo": proc_txt,
-                            "evento": prazo.evento,
-                            "data_limite": format_date_br(prazo.data_limite),
-                            "prioridade": prazo.prioridade,
-                        }
-                    )
-            else:
-                pid = label_to_id[filtro_proc_c]
-                prazos = PrazosService.list_by_processo(
-                    s, owner_user_id, pid, only_open=False
-                )
-
-                proc_obj = next(p for p in processos if p.id == pid)
-                proc_txt = f"{proc_obj.numero_processo} – {proc_obj.tipo_acao or 'Sem tipo de ação'}"
-
-                for prazo in prazos:
-                    txt = f"{prazo.evento} {(prazo.observacoes or '')}".lower()
-                    if busca and busca.lower() not in txt:
-                        continue
-
-                    data_c.append(
-                        {
-                            "prazo_id": prazo.id,
-                            "processo": proc_txt,
-                            "evento": prazo.evento,
-                            "data_limite": format_date_br(prazo.data_limite),
-                            "prioridade": prazo.prioridade,
-                        }
-                    )
-
-        if not data_c:
-            st.info("Nenhum prazo concluído encontrado.")
+        df = build_df(items, include_status=False, include_dias=False)
+        if df is None:
+            st.info("Nenhum prazo concluído com os filtros atuais.")
         else:
-            dfc = pd.DataFrame(data_c)
-            st.dataframe(dfc, use_container_width=True, hide_index=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
             st.divider()
-            st.subheader("♻️ Reabrir ou excluir (Concluídos)")
+            st.subheader("♻️ Reabrir / 🗑️ Excluir (Concluídos)")
+            _reabrir_excluir_concluidos(df, owner_user_id)
 
-            prazo_id_c = st.selectbox(
-                "Selecione o prazo_id",
-                dfc["prazo_id"].tolist(),
-                key="prazo_done_edit_select",
-            )
 
+# -------------------------
+# Blocos de ação (helpers)
+# -------------------------
+def _acoes_rapidas_prazos(df: pd.DataFrame) -> None:
+    ids = df["prazo_id"].astype(int).tolist()
+    prazo_id = st.selectbox(
+        "Selecione o prazo_id", ids, key=f"prazo_quick_{hash(tuple(ids))}"
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    if c1.button("✅ Concluir", key=f"prazo_quick_done_{prazo_id}"):
+        try:
             with get_session() as s:
-                pz = PrazosService.get(s, owner_user_id, int(prazo_id_c))
+                PrazosService.update(
+                    s,
+                    st.session_state.get("owner_user_id", None) or 0,
+                    int(prazo_id),
+                    PrazoUpdate(concluido=True),
+                )
+            st.success("Prazo concluído.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao concluir: {e}")
 
-            if not pz:
-                st.error("Prazo não encontrado.")
-            else:
-                b1, b2 = st.columns(2)
-                if b1.button(
-                    "Reabrir prazo (marcar como não concluído)",
-                    key=f"prazo_reopen_{prazo_id_c}",
-                ):
-                    try:
-                        with get_session() as s:
-                            PrazosService.update(
-                                s,
-                                owner_user_id,
-                                int(prazo_id_c),
-                                PrazoUpdate(concluido=False),
-                            )
-                        st.success("Prazo reaberto.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao reabrir: {e}")
+    if c2.button("♻️ Reabrir", key=f"prazo_quick_reopen_{prazo_id}"):
+        try:
+            with get_session() as s:
+                PrazosService.update(
+                    s,
+                    st.session_state.get("owner_user_id", None) or 0,
+                    int(prazo_id),
+                    PrazoUpdate(concluido=False),
+                )
+            st.success("Prazo reaberto.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao reabrir: {e}")
 
-                if b2.button(
-                    "Excluir prazo concluído", key=f"prazo_del_done_{prazo_id_c}"
-                ):
-                    try:
-                        with get_session() as s:
-                            PrazosService.delete(s, owner_user_id, int(prazo_id_c))
-                        st.warning("Prazo excluído.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao excluir: {e}")
+    if c3.button("🗑️ Excluir", key=f"prazo_quick_del_{prazo_id}"):
+        try:
+            with get_session() as s:
+                PrazosService.delete(
+                    s, st.session_state.get("owner_user_id", None) or 0, int(prazo_id)
+                )
+            st.warning("Prazo excluído.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao excluir: {e}")
+
+
+def _editar_excluir_prazo(df: pd.DataFrame, owner_user_id: int) -> None:
+    ids = df["prazo_id"].astype(int).tolist()
+    prazo_id = st.selectbox("Selecione o prazo_id", ids, key="prazo_open_edit_select")
+
+    with get_session() as s:
+        pz = PrazosService.get(s, owner_user_id, int(prazo_id))
+
+    if not pz:
+        st.error("Prazo não encontrado.")
+        return
+
+    with st.form(f"form_prazo_open_edit_{prazo_id}"):
+        c1, c2, c3 = st.columns(3)
+        evento_e = c1.text_input(
+            "Evento", value=pz.evento, key=f"prazo_open_evento_{prazo_id}"
+        )
+        data_e = c2.date_input(
+            "Data limite",
+            value=ensure_br(pz.data_limite).date(),
+            key=f"prazo_open_data_{prazo_id}",
+        )
+        prio_e = c3.selectbox(
+            "Prioridade",
+            list(PRIORIDADES),
+            index=(
+                list(PRIORIDADES).index(pz.prioridade)
+                if pz.prioridade in PRIORIDADES
+                else 1
+            ),
+            key=f"prazo_open_prio_{prazo_id}",
+        )
+
+        c4, c5 = st.columns(2)
+        origem_e = c4.text_input(
+            "Origem", value=pz.origem or "", key=f"prazo_open_origem_{prazo_id}"
+        )
+        referencia_e = c5.text_input(
+            "Referência", value=pz.referencia or "", key=f"prazo_open_ref_{prazo_id}"
+        )
+
+        concl = st.checkbox(
+            "Concluído", value=bool(pz.concluido), key=f"prazo_open_conc_{prazo_id}"
+        )
+        obs_e = st.text_area(
+            "Observações", value=pz.observacoes or "", key=f"prazo_open_obs_{prazo_id}"
+        )
+
+        b1, b2 = st.columns(2)
+        salvar = b1.form_submit_button("Salvar alterações", type="primary")
+        excluir = b2.form_submit_button("Excluir")
+
+    if salvar:
+        try:
+            with get_session() as s:
+                PrazosService.update(
+                    s,
+                    owner_user_id,
+                    int(prazo_id),
+                    PrazoUpdate(
+                        evento=evento_e,
+                        data_limite=date_to_br_datetime(data_e),
+                        prioridade=prio_e,
+                        concluido=concl,
+                        origem=(origem_e.strip() or None),
+                        referencia=(referencia_e.strip() or None),
+                        observacoes=obs_e,
+                    ),
+                )
+            st.success("Prazo atualizado.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao salvar: {e}")
+
+    if excluir:
+        try:
+            with get_session() as s:
+                PrazosService.delete(s, owner_user_id, int(prazo_id))
+            st.warning("Prazo excluído.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao excluir: {e}")
+
+
+def _reabrir_excluir_concluidos(df: pd.DataFrame, owner_user_id: int) -> None:
+    ids = df["prazo_id"].astype(int).tolist()
+    prazo_id = st.selectbox("Selecione o prazo_id", ids, key="prazo_done_edit_select")
+
+    c1, c2 = st.columns(2)
+
+    if c1.button("♻️ Reabrir prazo", key=f"prazo_reopen_{prazo_id}"):
+        try:
+            with get_session() as s:
+                PrazosService.update(
+                    s, owner_user_id, int(prazo_id), PrazoUpdate(concluido=False)
+                )
+            st.success("Prazo reaberto.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao reabrir: {e}")
+
+    if c2.button("🗑️ Excluir prazo", key=f"prazo_del_done_{prazo_id}"):
+        try:
+            with get_session() as s:
+                PrazosService.delete(s, owner_user_id, int(prazo_id))
+            st.warning("Prazo excluído.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao excluir: {e}")

@@ -78,7 +78,6 @@ def montar_email_prazos(atrasados, vencendo, due_days: int) -> Tuple[str, str]:
         lines.append("")
 
     lines.append("—")
-    lines.append("Sistema de Perícias (MVP local)")
     return subject, "\n".join(lines)
 
 
@@ -91,7 +90,7 @@ def anexar_agendamentos_no_email(
     payload: (ag_id, numero_processo, tipo, inicio(datetime), local)
     """
     if ag24_payload:
-        body += "\n🔔 AGENDAMENTOS (JANELA 1)\n"
+        body += "\n🔔 AGENDAMENTOS\n"
         for _, proc_num, tipo, inicio, local in ag24_payload:
             body += f"- {proc_num} – {tipo} | {inicio:%d/%m/%Y %H:%M} | {local}\n"
 
