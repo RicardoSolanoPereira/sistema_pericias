@@ -1,7 +1,12 @@
 # app/main.py
 import os
-import json
 import sys
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+import json
 import subprocess
 import sqlite3
 from dataclasses import dataclass
@@ -19,8 +24,10 @@ from db.models import User
 from app.ui import dashboard, processos, prazos, agendamentos, andamentos, financeiro
 from app.ui.theme import inject_global_css
 
+
 load_dotenv()
 init_db()
+
 
 st.set_page_config(
     page_title="Gestão Técnica",
