@@ -3,23 +3,42 @@ from __future__ import annotations
 import os
 import sqlite3
 from typing import Optional
-
 from pathlib import Path
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
 def get_db_url() -> str:
-    # 1) Se vier do ambiente/secrets, usa
-    env_url = os.getenv("DB_URL")
-    if env_url:
-        return env_url
+    """
+    Ordem de prioridade:
+    1) Streamlit Secrets (Cloud)
+    2) Variável de ambiente DB_URL
+    3) Fallback SQLite local
+    """
 
-    # 2) Fallback: sqlite em caminho absoluto dentro do repositório
-    repo_root = Path(__file__).resolve().parent.parent  # .../sistema_pericias
+    # 1️⃣ Streamlit Secrets (Cloud)
+    try:
+        import streamlit as st
+
+        if "DB_URL" in st.secrets:
+            db_url = str(st.secrets["DB_URL"]).strip()
+            if db_url:
+                return db_url
+    except Exception:
+        pass
+
+    # 2️⃣ Variável de ambiente
+    env_url = os.getenv("DB_URL")
+    if env_url and env_url.strip():
+        return env_url.strip()
+
+    # 3️⃣ Fallback SQLite local
+    repo_root = Path(__file__).resolve().parent.parent
     db_path = repo_root / "data" / "app.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
+
     return f"sqlite:///{db_path.as_posix()}"
 
 
@@ -27,6 +46,7 @@ class Base(DeclarativeBase):
     pass
 
 
+# Ativa foreign keys no SQLite
 @event.listens_for(Engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, connection_record):
     try:
@@ -52,6 +72,7 @@ def _build_connect_args(db_url: str) -> dict:
 
 def get_engine() -> Engine:
     global _engine, _SessionLocal
+
     if _engine is None:
         db_url = get_db_url()
         connect_args = _build_connect_args(db_url)
