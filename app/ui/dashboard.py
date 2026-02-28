@@ -1,30 +1,29 @@
+# app/ui/dashboard.py
 import streamlit as st
 import pandas as pd
-import sys
-import subprocess
-from datetime import datetime, timedelta, time
-from pathlib import Path
+from datetime import datetime, timedelta, time, date
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 
 from db.connection import get_session
 from db.models import Processo, Prazo, LancamentoFinanceiro, Agendamento
 from core.utils import now_br, ensure_br, format_date_br
 from app.ui.theme import inject_global_css, card
+from app.ui_state import navigate
+from app.ui.components import page_header
 
-
-TIPOS_TRABALHO = (
-    "Perito Judicial",
-    "Assistente Técnico",
-    "Trabalho Particular",
-)
+ATUACAO_UI = {
+    "(Todas)": None,
+    "Perícia (Juízo)": "Perito Judicial",
+    "Assistência Técnica": "Assistente Técnico",
+    "Particular / Outros serviços": "Trabalho Particular",
+}
 
 
 # -------------------------
-# Helpers (time/format)
+# Helpers
 # -------------------------
 def _naive(dt: datetime) -> datetime:
-    """Garante datetime naive (SQLite costuma trabalhar sem tz)."""
     try:
         if getattr(dt, "tzinfo", None) is not None:
             return dt.replace(tzinfo=None)
@@ -39,7 +38,7 @@ def _dias_restantes(dt) -> int:
     return (dt_br.date() - hoje).days
 
 
-def _semaforo(dias: int) -> str:
+def _status_prazo(dias: int) -> str:
     if dias < 0:
         return "🔴 Atrasado"
     if dias <= 5:
@@ -50,87 +49,95 @@ def _semaforo(dias: int) -> str:
 
 
 def _fmt_money_br(v: float) -> str:
+    try:
+        v = float(v or 0)
+    except Exception:
+        v = 0.0
     return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-# -------------------------
-# Paths / Backup
-# -------------------------
-def _project_root() -> Path:
-    """
-    Raiz estável do projeto:
-    app/ui/dashboard.py -> app -> <raiz>
-    """
-    return Path(__file__).resolve().parents[2]
-
-
-def _get_last_backup_info() -> dict:
-    """
-    Procura o último backup em <raiz>/backups, independente do CWD.
-    Espera arquivos: app_backup_*.db
-    """
-    backup_dir = _project_root() / "backups"
-    if not backup_dir.exists():
-        return {"status": "missing_dir", "backup_dir": str(backup_dir)}
-
-    backups = list(backup_dir.glob("app_backup_*.db"))
-    if not backups:
-        return {"status": "empty", "backup_dir": str(backup_dir)}
-
-    last = max(backups, key=lambda p: p.stat().st_mtime)
-    dt = datetime.fromtimestamp(last.stat().st_mtime)
-    size_mb = last.stat().st_size / (1024 * 1024)
-
-    return {
-        "status": "ok",
-        "backup_dir": str(backup_dir),
-        "file": last.name,
-        "dt": dt,
-        "size_mb": size_mb,
-    }
-
-
-def _run_backup_now() -> tuple[bool, str]:
-    """
-    Executa o backup chamando o mesmo interpretador do Streamlit.
-    Retorna (ok, msg). Usa cwd na raiz do projeto para garantir paths/exports.
-    """
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "scripts.backup_diario"],
-            capture_output=True,
-            text=True,
-            cwd=str(_project_root()),
-        )
-        if proc.returncode != 0:
-            err = (
-                (proc.stderr or "").strip()
-                or (proc.stdout or "").strip()
-                or "Falha ao executar backup."
-            )
-            return False, err
-
-        out = (proc.stdout or "").strip() or "Backup executado."
-        return True, out
-    except Exception as e:
-        return False, str(e)
-
-
-# -------------------------
-# Queries (isoladas)
-# -------------------------
 def _apply_tipo_filter(stmt, tipo_val):
     return stmt if not tipo_val else stmt.where(Processo.papel == tipo_val)
 
 
-def _fetch_kpis(owner_user_id: int, tipo_val: str | None) -> dict:
+def _pct(a: int, b: int) -> str:
+    if b <= 0:
+        return "0%"
+    return f"{round((a / b) * 100)}%"
+
+
+def _prior_badge(p: str | None) -> str:
+    p = (p or "Média").strip()
+    if p.lower().startswith("a"):
+        return "🔥 Alta"
+    if p.lower().startswith("b"):
+        return "🧊 Baixa"
+    return "⚖️ Média"
+
+
+def _date_range_strings(hoje: date) -> tuple[str, str]:
+    """Para cache_data: entradas hashable e estáveis."""
+    ate7 = hoje + timedelta(days=7)
+    return hoje.isoformat(), ate7.isoformat()
+
+
+def _dt_bounds(hoje: date) -> tuple[datetime, datetime]:
+    ate7 = hoje + timedelta(days=7)
+    start_today = datetime.combine(hoje, time.min)
+    end_7d = datetime.combine(ate7, time.max)
+    return start_today, end_7d
+
+
+def _build_prazos_df(rows) -> pd.DataFrame:
+    data = []
+    for (
+        _id,
+        evento,
+        data_limite,
+        prioridade,
+        numero_processo,
+        tipo_acao,
+    ) in rows:
+        dias = int(_dias_restantes(data_limite))
+        data.append(
+            {
+                "Trabalho": f"{numero_processo} – {tipo_acao or 'Sem tipo'}",
+                "Evento": evento,
+                "Venc.": format_date_br(data_limite),
+                "Dias": dias,
+                "Status": _status_prazo(dias),
+                "Prior.": _prior_badge(prioridade),
+            }
+        )
+    if not data:
+        return pd.DataFrame()
+    return pd.DataFrame(data).sort_values(by=["Dias", "Venc."], ascending=True)
+
+
+def _build_agenda_df(rows) -> pd.DataFrame:
+    data = []
+    for _id, tipo, inicio, local, numero_processo, tipo_acao in rows:
+        data.append(
+            {
+                "Trabalho": f"{numero_processo} – {tipo_acao or 'Sem tipo'}",
+                "Tipo": tipo,
+                "Início": ensure_br(inicio).strftime("%d/%m/%Y %H:%M"),
+                "Local": local or "",
+            }
+        )
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
+
+# -------------------------
+# Queries (cacheadas)
+# -------------------------
+@st.cache_data(show_spinner=False, ttl=45)
+def _fetch_kpis_cached(owner_user_id: int, tipo_val: str | None, hoje_iso: str) -> dict:
+    hoje_sp = date.fromisoformat(hoje_iso)
+
+    start_today, end_7d = _dt_bounds(hoje_sp)
     now = now_br()
     now_n = _naive(now)
-    hoje_sp = now.date()
-    ate_7_sp = hoje_sp + timedelta(days=7)
-
-    start_today = datetime.combine(hoje_sp, time.min)
-    end_7d = datetime.combine(ate_7_sp, time.max)
 
     with get_session() as s:
         # Total processos
@@ -148,29 +155,45 @@ def _fetch_kpis(owner_user_id: int, tipo_val: str | None) -> dict:
         stmt_ativos = _apply_tipo_filter(stmt_ativos, tipo_val)
         ativos = int(s.execute(stmt_ativos).scalar_one())
 
-        # Prazos abertos (contagem em Python por causa do fuso)
-        stmt_prazos = (
-            select(Prazo.data_limite)
+        # Prazos abertos + contagens por janela (SQL, sem loop Python)
+        stmt_prazos_counts = (
+            select(
+                func.count(Prazo.id).label("abertos"),
+                func.coalesce(
+                    func.sum(case((Prazo.data_limite < start_today, 1), else_=0)),
+                    0,
+                ).label("atrasados"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                (Prazo.data_limite >= start_today)
+                                & (Prazo.data_limite <= end_7d),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("em_7d"),
+            )
+            .select_from(Prazo)
             .join(Processo, Processo.id == Prazo.processo_id)
             .where(
                 Processo.owner_user_id == owner_user_id,
                 Prazo.concluido == False,  # noqa
             )
         )
-        stmt_prazos = _apply_tipo_filter(stmt_prazos, tipo_val)
-        prazos_rows = s.execute(stmt_prazos).all()
+        stmt_prazos_counts = _apply_tipo_filter(stmt_prazos_counts, tipo_val)
+        prazos_abertos, prazos_atrasados, prazos_7dias = s.execute(
+            stmt_prazos_counts
+        ).one()
 
-        prazos_abertos = len(prazos_rows)
-        prazos_atrasados = 0
-        prazos_7dias = 0
-        for (data_limite,) in prazos_rows:
-            d = ensure_br(data_limite).date()
-            if d < hoje_sp:
-                prazos_atrasados += 1
-            elif hoje_sp <= d <= ate_7_sp:
-                prazos_7dias += 1
+        prazos_abertos = int(prazos_abertos or 0)
+        prazos_atrasados = int(prazos_atrasados or 0)
+        prazos_7dias = int(prazos_7dias or 0)
 
-        # Agendamentos próximos (7 dias)
+        # Agenda 7 dias
         stmt_ag_7d = (
             select(func.count(Agendamento.id))
             .join(Processo, Processo.id == Agendamento.processo_id)
@@ -184,7 +207,7 @@ def _fetch_kpis(owner_user_id: int, tipo_val: str | None) -> dict:
         stmt_ag_7d = _apply_tipo_filter(stmt_ag_7d, tipo_val)
         ag_7d = int(s.execute(stmt_ag_7d).scalar_one())
 
-        # Financeiro (saldo)
+        # Financeiro (duas somas)
         stmt_receitas = (
             select(func.coalesce(func.sum(LancamentoFinanceiro.valor), 0))
             .join(Processo, Processo.id == LancamentoFinanceiro.processo_id)
@@ -204,8 +227,8 @@ def _fetch_kpis(owner_user_id: int, tipo_val: str | None) -> dict:
         stmt_receitas = _apply_tipo_filter(stmt_receitas, tipo_val)
         stmt_despesas = _apply_tipo_filter(stmt_despesas, tipo_val)
 
-        receitas = float(s.execute(stmt_receitas).scalar_one())
-        despesas = float(s.execute(stmt_despesas).scalar_one())
+        receitas = float(s.execute(stmt_receitas).scalar_one() or 0)
+        despesas = float(s.execute(stmt_despesas).scalar_one() or 0)
 
     saldo = receitas - despesas
 
@@ -213,7 +236,6 @@ def _fetch_kpis(owner_user_id: int, tipo_val: str | None) -> dict:
         "now": now,
         "now_n": now_n,
         "hoje_sp": hoje_sp,
-        "ate_7_sp": ate_7_sp,
         "start_today": start_today,
         "end_7d": end_7d,
         "total_proc": total_proc,
@@ -222,16 +244,19 @@ def _fetch_kpis(owner_user_id: int, tipo_val: str | None) -> dict:
         "prazos_atrasados": prazos_atrasados,
         "prazos_7dias": prazos_7dias,
         "ag_7d": ag_7d,
+        "receitas": receitas,
+        "despesas": despesas,
         "saldo": saldo,
     }
 
 
-def _fetch_prazos_tables(
-    owner_user_id: int,
-    tipo_val: str | None,
-    start_today: datetime,
-    end_7d: datetime,
+@st.cache_data(show_spinner=False, ttl=45)
+def _fetch_prazos_tables_cached(
+    owner_user_id: int, tipo_val: str | None, start_today_iso: str, end_7d_iso: str
 ) -> tuple[list, list]:
+    start_today = datetime.fromisoformat(start_today_iso)
+    end_7d = datetime.fromisoformat(end_7d_iso)
+
     with get_session() as s:
         stmt_atrasados = (
             select(
@@ -279,9 +304,12 @@ def _fetch_prazos_tables(
     return rows_atrasados, rows_7d
 
 
-def _fetch_agendamentos(
-    owner_user_id: int, tipo_val: str | None, now_n: datetime
+@st.cache_data(show_spinner=False, ttl=45)
+def _fetch_agendamentos_cached(
+    owner_user_id: int, tipo_val: str | None, now_n_iso: str
 ) -> tuple[list, list]:
+    now_n = datetime.fromisoformat(now_n_iso)
+
     with get_session() as s:
         stmt_24h = (
             select(
@@ -330,7 +358,8 @@ def _fetch_agendamentos(
     return rows_24h, rows_7d
 
 
-def _fetch_ultimos_processos(owner_user_id: int, tipo_val: str | None) -> list:
+@st.cache_data(show_spinner=False, ttl=60)
+def _fetch_ultimos_processos_cached(owner_user_id: int, tipo_val: str | None) -> list:
     with get_session() as s:
         stmt = (
             select(
@@ -344,7 +373,7 @@ def _fetch_ultimos_processos(owner_user_id: int, tipo_val: str | None) -> list:
             )
             .where(Processo.owner_user_id == owner_user_id)
             .order_by(Processo.id.desc())
-            .limit(10)
+            .limit(12)
         )
         stmt = _apply_tipo_filter(stmt, tipo_val)
         return s.execute(stmt).all()
@@ -356,237 +385,311 @@ def _fetch_ultimos_processos(owner_user_id: int, tipo_val: str | None) -> list:
 def render(owner_user_id: int):
     inject_global_css()
 
-    # Topo + filtro + botões
-    col_title, col_filter, col_actions = st.columns([6, 2, 2])
-    with col_title:
-        st.title("📌 Dashboard")
-        st.caption("Painel de risco e próximos passos (prazos e agenda)")
+    # CSS leve para hierarquia / espaço
+    st.markdown(
+        """
+        <style>
+        .muted { color: rgba(49,51,63,0.65); font-size: 0.92rem; }
+        .panel-title { font-size: 1.05rem; font-weight: 800; margin: 0 0 6px 0; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    with col_filter:
-        filtro_tipo = st.selectbox(
-            "Visualizar",
-            ["(Todos)"] + list(TIPOS_TRABALHO),
+    clicked_refresh = page_header(
+        "Painel de Controle",
+        "Visão analítica: alertas, prazos, agenda e financeiro",
+        right_button_label="Recarregar",
+        right_button_key="dash_btn_recarregar_top",
+        right_button_help="Recarrega os dados do painel",
+    )
+    if clicked_refresh:
+        st.cache_data.clear()
+        st.rerun()
+
+    # Filtro (Atuação)
+    f1, _ = st.columns([0.28, 0.72], vertical_alignment="center")
+    with f1:
+        atuacao_label = st.selectbox(
+            "Atuação",
+            list(ATUACAO_UI.keys()),
             index=0,
-            key="dash_filtro_tipo",
+            key="dash_atuacao_ui",
         )
-        tipo_val = None if filtro_tipo == "(Todos)" else filtro_tipo
+        tipo_val = ATUACAO_UI[atuacao_label]
 
-    with col_actions:
-        # botão de refresh
-        if st.button("🔄 Atualizar", use_container_width=True):
-            st.rerun()
+    hoje_sp = now_br().date()
+    hoje_iso, _ = _date_range_strings(hoje_sp)
+    k = _fetch_kpis_cached(owner_user_id, tipo_val, hoje_iso)
 
-    # KPIs
-    k = _fetch_kpis(owner_user_id, tipo_val)
+    pct_atraso = _pct(k["prazos_atrasados"], k["prazos_abertos"])
+    pct_7d = _pct(k["prazos_7dias"], k["prazos_abertos"])
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1:
-        card("Processos", str(k["total_proc"]), "cadastrados")
-    with c2:
-        card("Ativos", str(k["ativos"]), "em andamento")
-    with c3:
-        card("Prazos abertos", str(k["prazos_abertos"]), "não concluídos")
-    with c4:
-        card("Atrasados", str(k["prazos_atrasados"]), "prazos")
-    with c5:
-        card("Agendamentos (7d)", str(k["ag_7d"]), "status Agendado")
-    with c6:
-        card("Saldo (R$)", _fmt_money_br(k["saldo"]), "receitas - despesas")
+    # ============================================================
+    # 1) ALERTAS (TOPO)
+    # ============================================================
+    with st.container(border=True):
+        st.subheader("Alertas de hoje")
+        c1, c2 = st.columns([0.72, 0.28], vertical_alignment="center")
 
-    # -------------------------
-    # Backup (status + botão)
-    # -------------------------
-    st.markdown("### 🛡️ Backup")
-    col_bk_info, col_bk_btn = st.columns([4, 1])
+        if k["prazos_atrasados"] > 0:
+            with c1:
+                st.markdown(
+                    f"**🔴 Atenção:** existem **{int(k['prazos_atrasados'])}** prazo(s) atrasado(s). "
+                    f"<span class='muted'>Atuação: <b>{atuacao_label}</b>.</span>",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if st.button(
+                    "Abrir atrasados",
+                    key="dash_open_atrasados",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    navigate(
+                        "Prazos",
+                        state={
+                            "prazos_section": "Lista",
+                            "pz_nav_to": "Lista",
+                            "pz_list_nav_to": "Atrasados",
+                        },
+                    )
 
-    with col_bk_btn:
-        if st.button("💾 Backup agora", use_container_width=True):
-            with st.spinner("Executando backup..."):
-                ok, msg = _run_backup_now()
-            if ok:
-                st.success("Backup executado.")
-                st.rerun()
-            else:
-                st.error("Falha ao executar backup.")
-                st.caption(msg)
-
-    info_bk = _get_last_backup_info()
-    with col_bk_info:
-        if info_bk["status"] == "missing_dir":
-            st.warning(f"Pasta de backups não encontrada: `{info_bk['backup_dir']}`")
-        elif info_bk["status"] == "empty":
-            st.warning(f"Nenhum backup encontrado em: `{info_bk['backup_dir']}`")
+        elif k["prazos_7dias"] > 0:
+            with c1:
+                st.markdown(
+                    f"**🟠 Prazos próximos:** **{int(k['prazos_7dias'])}** vence(m) em até 7 dias. "
+                    f"<span class='muted'>Atuação: <b>{atuacao_label}</b>.</span>",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if st.button(
+                    "Ver 7 dias",
+                    key="dash_open_7d",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    navigate(
+                        "Prazos",
+                        state={
+                            "prazos_section": "Lista",
+                            "pz_nav_to": "Lista",
+                            "pz_list_nav_to": "Vencem (7 dias)",
+                        },
+                    )
         else:
-            dt = info_bk["dt"]
-            hours = (datetime.now() - dt).total_seconds() / 3600
+            with c1:
+                st.markdown(
+                    f"**🟢 Tudo em ordem:** nenhum prazo crítico no momento. "
+                    f"<span class='muted'>Atuação: <b>{atuacao_label}</b>.</span>",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if st.button(
+                    "Cadastrar prazo", key="dash_go_new_prazo", use_container_width=True
+                ):
+                    navigate("Prazos", state={"prazos_section": "Cadastro"})
 
-            cb1, cb2, cb3 = st.columns([2, 1, 1])
-            with cb1:
-                st.write(f"**Arquivo:** {info_bk['file']}")
-                st.caption(f"Pasta: {info_bk['backup_dir']}")
-            with cb2:
-                st.write(f"**Data/Hora:** {dt:%d/%m/%Y %H:%M:%S}")
-            with cb3:
-                st.write(f"**Tamanho:** {info_bk['size_mb']:.2f} MB")
+    st.write("")
 
-            if hours > 24:
-                st.error(f"⚠️ Último backup há {int(hours)} horas.")
-            else:
-                st.success("✅ Backup recente.")
+    # ============================================================
+    # 2) MÉTRICAS (OPERACIONAL + FINANCEIRO)
+    # ============================================================
+    with st.container(border=True):
+        st.subheader("Resumo")
 
-    # -------------------------
-    # Mensagem de risco (prazos)
-    # -------------------------
-    if k["prazos_atrasados"] > 0:
-        st.error(
-            f"⚠️ Existem {int(k['prazos_atrasados'])} prazo(s) atrasado(s). "
-            f"Filtro: {filtro_tipo}."
+        # Operacional
+        st.markdown(
+            "<div class='panel-title'>Operacional</div>", unsafe_allow_html=True
         )
-    elif k["prazos_7dias"] > 0:
-        st.warning(
-            f"🟠 Existem {int(k['prazos_7dias'])} prazo(s) vencendo nos próximos 7 dias. "
-            f"Filtro: {filtro_tipo}."
-        )
-    else:
-        st.success(f"✅ Nenhum prazo crítico no momento. Filtro: {filtro_tipo}.")
+        op1, op2, op3, op4 = st.columns(4)
+        with op1:
+            card("Trabalhos", f"{k['total_proc']}", "cadastrados", tone="info")
+            if st.button("Ver todos", use_container_width=True, key="go_proc"):
+                navigate(
+                    "Processos",
+                    qp={"status": None, "atuacao": None, "categoria": None, "q": None},
+                    state={"processos_section": "Lista"},
+                )
+
+        with op2:
+            card("Ativos", f"{k['ativos']}", "em andamento", tone="neutral")
+            if st.button("Ver ativos", use_container_width=True, key="go_proc_ativos"):
+                navigate(
+                    "Processos",
+                    qp={"status": "Ativo"},
+                    state={"processos_section": "Lista"},
+                )
+
+        with op3:
+            tone_pz = (
+                "danger"
+                if k["prazos_atrasados"] > 0
+                else ("warning" if k["prazos_7dias"] > 0 else "success")
+            )
+            card(
+                "Prazos abertos",
+                f"{k['prazos_abertos']}",
+                f"{pct_atraso} atrasados • {pct_7d} em 7d",
+                tone=tone_pz,
+            )
+            if st.button("Ver prazos", use_container_width=True, key="go_prazos"):
+                navigate(
+                    "Prazos",
+                    state={
+                        "prazos_section": "Lista",
+                        "pz_nav_to": "Lista",
+                        "pz_list_nav_to": "Abertos",
+                    },
+                )
+
+        with op4:
+            card("Agenda (7 dias)", f"{k['ag_7d']}", "agendados", tone="info")
+            if st.button("Ver agenda", use_container_width=True, key="go_agenda"):
+                navigate("Agendamentos")
+
+        st.write("")
+
+        # Financeiro
+        st.markdown("<div class='panel-title'>Financeiro</div>", unsafe_allow_html=True)
+        fin1, fin2, fin3 = st.columns([0.28, 0.28, 0.44], vertical_alignment="top")
+        with fin1:
+            card(
+                "Receitas (R$)",
+                _fmt_money_br(k["receitas"]),
+                "acumulado",
+                tone="success",
+            )
+        with fin2:
+            card(
+                "Despesas (R$)",
+                _fmt_money_br(k["despesas"]),
+                "acumulado",
+                tone="danger",
+            )
+        with fin3:
+            tone_saldo = "success" if k["saldo"] >= 0 else "danger"
+            card(
+                "Saldo (R$)",
+                _fmt_money_br(k["saldo"]),
+                "receitas - despesas",
+                tone=tone_saldo,
+                emphasize=True,
+            )
+            if st.button(
+                "Abrir financeiro",
+                use_container_width=True,
+                key="go_fin",
+                type="primary",
+            ):
+                navigate("Financeiro", state={"financeiro_section": "Lançamentos"})
 
     st.divider()
 
-    # -------------------------
-    # Prazos: atrasados e vencendo 7 dias
-    # -------------------------
-    colA, colB = st.columns([1, 1])
-    rows_atrasados, rows_7d = _fetch_prazos_tables(
-        owner_user_id, tipo_val, k["start_today"], k["end_7d"]
-    )
+    # ============================================================
+    # 3) LISTAS ANALÍTICAS (TABS)
+    # ============================================================
+    tab1, tab2, tab3 = st.tabs(["⏳ Prazos", "📅 Agenda", "🗂️ Trabalhos"])
 
-    with colA:
-        st.subheader("🔴 Prazos atrasados (Top 10)")
-        if not rows_atrasados:
-            st.caption("Sem prazos atrasados.")
-        else:
-            data = []
-            for (
-                prazo_id,
-                evento,
-                data_limite,
-                prioridade,
-                numero_processo,
-                tipo_acao,
-            ) in rows_atrasados:
-                dias = _dias_restantes(data_limite)
-                data.append(
-                    {
-                        "id": int(prazo_id),
-                        "processo": f"{numero_processo} – {tipo_acao or 'Sem tipo'}",
-                        "evento": evento,
-                        "data": format_date_br(data_limite),
-                        "dias": int(dias),
-                        "status": _semaforo(dias),
-                        "prioridade": prioridade or "Média",
-                    }
-                )
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+    with tab1:
+        rows_atrasados, rows_7d = _fetch_prazos_tables_cached(
+            owner_user_id,
+            tipo_val,
+            k["start_today"].isoformat(timespec="seconds"),
+            k["end_7d"].isoformat(timespec="seconds"),
+        )
 
-    with colB:
-        st.subheader("🟠 Vencem em 7 dias (Top 10)")
-        if not rows_7d:
-            st.caption("Sem prazos vencendo em até 7 dias.")
-        else:
-            data = []
-            for (
-                prazo_id,
-                evento,
-                data_limite,
-                prioridade,
-                numero_processo,
-                tipo_acao,
-            ) in rows_7d:
-                dias = _dias_restantes(data_limite)
-                data.append(
-                    {
-                        "id": int(prazo_id),
-                        "processo": f"{numero_processo} – {tipo_acao or 'Sem tipo'}",
-                        "evento": evento,
-                        "data": format_date_br(data_limite),
-                        "dias": int(dias),
-                        "status": _semaforo(dias),
-                        "prioridade": prioridade or "Média",
-                    }
-                )
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+        colA, colB = st.columns(2, vertical_alignment="top")
 
-    st.divider()
+        with colA:
+            with st.container(border=True):
+                st.subheader("Prazos atrasados")
+                st.caption("Top 10 por data mais antiga")
+                if not rows_atrasados:
+                    st.caption("Sem prazos atrasados.")
+                else:
+                    df = _build_prazos_df(rows_atrasados)
+                    st.dataframe(
+                        df, use_container_width=True, hide_index=True, height=280
+                    )
 
-    # -------------------------
-    # Agendamentos próximos: 24h e 7 dias
-    # -------------------------
-    st.subheader("📅 Agendamentos próximos")
-    col1, col2 = st.columns([1, 1])
+        with colB:
+            with st.container(border=True):
+                st.subheader("Vencem em até 7 dias")
+                st.caption("Top 10 por vencimento")
+                if not rows_7d:
+                    st.caption("Sem prazos vencendo em até 7 dias.")
+                else:
+                    df = _build_prazos_df(rows_7d)
+                    st.dataframe(
+                        df, use_container_width=True, hide_index=True, height=280
+                    )
 
-    rows_24h, rows_ag_7d = _fetch_agendamentos(owner_user_id, tipo_val, k["now_n"])
+    with tab2:
+        rows_24h, rows_ag_7d = _fetch_agendamentos_cached(
+            owner_user_id, tipo_val, k["now_n"].isoformat(timespec="seconds")
+        )
 
-    with col1:
-        st.markdown("#### ⏰ Em 24 horas (Top 10)")
-        if not rows_24h:
-            st.caption("Sem agendamentos nas próximas 24h.")
-        else:
-            data = []
-            for ag_id, tipo, inicio, local, numero_processo, tipo_acao in rows_24h:
-                data.append(
-                    {
-                        "id": int(ag_id),
-                        "processo": f"{numero_processo} – {tipo_acao or 'Sem tipo'}",
-                        "tipo": tipo,
-                        "início": ensure_br(inicio).strftime("%d/%m/%Y %H:%M"),
-                        "local": local or "",
-                    }
-                )
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+        col1, col2 = st.columns(2, vertical_alignment="top")
 
-    with col2:
-        st.markdown("#### 📆 Em 7 dias (Top 10)")
-        if not rows_ag_7d:
-            st.caption("Sem agendamentos nos próximos 7 dias.")
-        else:
-            data = []
-            for ag_id, tipo, inicio, local, numero_processo, tipo_acao in rows_ag_7d:
-                data.append(
-                    {
-                        "id": int(ag_id),
-                        "processo": f"{numero_processo} – {tipo_acao or 'Sem tipo'}",
-                        "tipo": tipo,
-                        "início": ensure_br(inicio).strftime("%d/%m/%Y %H:%M"),
-                        "local": local or "",
-                    }
-                )
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+        with col1:
+            with st.container(border=True):
+                st.subheader("Próximas 24 horas")
+                if not rows_24h:
+                    st.caption("✅ Sem agendamentos nas próximas 24 horas.")
+                else:
+                    dfa = _build_agenda_df(rows_24h)
+                    st.dataframe(
+                        dfa, use_container_width=True, hide_index=True, height=280
+                    )
 
-    st.divider()
+        with col2:
+            with st.container(border=True):
+                st.subheader("Próximos 7 dias")
+                if not rows_ag_7d:
+                    st.caption("✅ Sem agendamentos nos próximos 7 dias.")
+                else:
+                    dfa = _build_agenda_df(rows_ag_7d)
+                    st.dataframe(
+                        dfa, use_container_width=True, hide_index=True, height=280
+                    )
 
-    # -------------------------
-    # Últimos processos
-    # -------------------------
-    st.subheader("🗂️ Últimos processos")
-    st.caption("Processos mais recentes cadastrados no sistema (respeita o filtro)")
+    with tab3:
+        procs = _fetch_ultimos_processos_cached(owner_user_id, tipo_val)
 
-    procs = _fetch_ultimos_processos(owner_user_id, tipo_val)
-    if not procs:
-        st.info("Nenhum processo cadastrado ainda para este filtro.")
-        return
+        with st.container(border=True):
+            st.subheader("Últimos trabalhos")
+            st.caption("Registros mais recentes cadastrados (respeita a atuação)")
 
-    dfp = pd.DataFrame(
-        procs,
-        columns=[
-            "id",
-            "numero_processo",
-            "tipo_acao",
-            "comarca",
-            "vara",
-            "status",
-            "tipo_trabalho",
-        ],
-    )
-    dfp["tipo_acao"] = dfp["tipo_acao"].fillna("Sem tipo de ação")
-    dfp["tipo_trabalho"] = dfp["tipo_trabalho"].fillna("Assistente Técnico")
-    st.dataframe(dfp, use_container_width=True, hide_index=True)
+            if not procs:
+                st.caption("Nenhum trabalho cadastrado ainda para esta atuação.")
+                return
+
+            dfp = pd.DataFrame(
+                procs,
+                columns=[
+                    "id",
+                    "numero_processo",
+                    "tipo_acao",
+                    "comarca",
+                    "vara",
+                    "status",
+                    "tipo_trabalho",
+                ],
+            )
+            dfp["tipo_acao"] = dfp["tipo_acao"].fillna("Sem tipo")
+            dfp["tipo_trabalho"] = dfp["tipo_trabalho"].fillna("Assistente Técnico")
+
+            dfp = dfp.rename(
+                columns={
+                    "id": "ID",
+                    "numero_processo": "Referência",
+                    "tipo_acao": "Descrição",
+                    "comarca": "Comarca",
+                    "vara": "Vara",
+                    "status": "Status",
+                    "tipo_trabalho": "Atuação",
+                }
+            )
+
+            st.dataframe(dfp, use_container_width=True, hide_index=True, height=380)

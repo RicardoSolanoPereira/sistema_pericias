@@ -21,6 +21,7 @@ class BackupResult:
     size_bytes: int
     integrity_ok: Optional[bool] = None
     integrity_message: Optional[str] = None
+    integrity_checked_at: Optional[datetime] = None
 
 
 # -----------------------------
@@ -39,13 +40,6 @@ def ensure_dir(p: Path) -> None:
 
 
 def find_db_path(root: Path, filename: str = "app.db") -> Path:
-    """
-    Procura o arquivo do banco a partir da raiz do projeto.
-    Prioriza:
-    - <root>/app.db
-    - <root>/db/app.db
-    - primeiro encontrado recursivamente
-    """
     candidates = [
         root / filename,
         root / "db" / filename,
@@ -81,7 +75,6 @@ def sqlite_integrity_check(db_path: Path) -> tuple[bool, str]:
 def sqlite_hot_backup(source_db: Path, backup_file: Path) -> None:
     """
     Backup "quente" seguro usando API nativa do SQLite.
-    Evita cópia inconsistente se o app estiver gravando no mesmo momento.
     """
     source_db = source_db.resolve()
     backup_file = backup_file.resolve()
@@ -96,9 +89,6 @@ def sqlite_hot_backup(source_db: Path, backup_file: Path) -> None:
 # Manifest / cleanup
 # -----------------------------
 def write_last_backup_manifest(backup_dir: Path, result: BackupResult) -> Path:
-    """
-    Escreve manifesto para o Streamlit ler sem varrer pasta.
-    """
     manifest = backup_dir / "last_backup.json"
     payload = {
         "source_db": str(result.source_db),
@@ -107,6 +97,11 @@ def write_last_backup_manifest(backup_dir: Path, result: BackupResult) -> Path:
         "size_bytes": result.size_bytes,
         "integrity_ok": result.integrity_ok,
         "integrity_message": result.integrity_message,
+        "integrity_checked_at": (
+            result.integrity_checked_at.isoformat(timespec="seconds")
+            if result.integrity_checked_at
+            else None
+        ),
     }
     manifest.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -115,9 +110,6 @@ def write_last_backup_manifest(backup_dir: Path, result: BackupResult) -> Path:
 
 
 def cleanup_old_backups(backup_dir: Path, pattern: str, keep: int) -> list[Path]:
-    """
-    Remove backups excedentes, mantendo os 'keep' mais recentes (por mtime).
-    """
     files = [p for p in backup_dir.glob(pattern) if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
@@ -127,7 +119,6 @@ def cleanup_old_backups(backup_dir: Path, pattern: str, keep: int) -> list[Path]
             old.unlink()
             removed.append(old)
         except OSError:
-            # se estiver sem permissão/lock, ignora
             pass
     return removed
 
@@ -142,7 +133,6 @@ def run_backup(
     backup_dir: Path,
     prefix: str,
     max_backups: int,
-    run_integrity: bool,
     write_manifest: bool,
 ) -> BackupResult:
     ensure_dir(backup_dir)
@@ -153,17 +143,17 @@ def run_backup(
     timestamp = created_at.strftime("%Y-%m-%d_%H-%M-%S")
     backup_file = (backup_dir / f"{prefix}{timestamp}.db").resolve()
 
-    # 1) opcional: integrity do banco origem (antes)
-    integrity_ok = None
-    integrity_message = None
-    if run_integrity:
-        ok, msg = sqlite_integrity_check(db_path)
-        integrity_ok, integrity_message = ok, msg
-
-    # 2) backup seguro
+    # 1) backup seguro
     sqlite_hot_backup(db_path, backup_file)
 
     size_bytes = backup_file.stat().st_size
+
+    # 2) integrity do BACKUP (sempre)
+    integrity_checked_at = datetime.now()
+    ok, msg = sqlite_integrity_check(backup_file)
+    integrity_ok = ok
+    integrity_message = None if ok else msg
+
     result = BackupResult(
         source_db=db_path,
         backup_file=backup_file,
@@ -171,6 +161,7 @@ def run_backup(
         size_bytes=size_bytes,
         integrity_ok=integrity_ok,
         integrity_message=integrity_message,
+        integrity_checked_at=integrity_checked_at,
     )
 
     # 3) manifesto
@@ -207,11 +198,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quantidade máxima de backups para manter.",
     )
     p.add_argument(
-        "--integrity",
-        action="store_true",
-        help="Executa PRAGMA integrity_check antes do backup.",
-    )
-    p.add_argument(
         "--no-manifest",
         action="store_true",
         help="Não escreve backups/last_backup.json.",
@@ -235,7 +221,6 @@ def main(argv: list[str] | None = None) -> int:
             backup_dir=backup_dir,
             prefix=args.prefix,
             max_backups=max(1, int(args.max_backups)),
-            run_integrity=bool(args.integrity),
             write_manifest=not bool(args.no_manifest),
         )
     except Exception as e:
@@ -250,11 +235,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"     Arquivo: {result.backup_file.name}")
     print(f"     Data:    {result.created_at:%d/%m/%Y %H:%M:%S}")
     print(f"     Tamanho: {size_mb:.2f} MB")
-    if result.integrity_ok is not None:
-        if result.integrity_ok:
-            print("     Integrity: OK")
-        else:
-            print(f"     Integrity: FALHA ({result.integrity_message})")
+    if result.integrity_ok:
+        print("     Integrity (backup): OK")
+    else:
+        print(f"     Integrity (backup): FALHA ({result.integrity_message})")
 
     return 0
 
