@@ -75,7 +75,16 @@ def get_engine() -> Engine:
 
     if _engine is None:
         db_url = get_db_url()
-        connect_args = _build_connect_args(db_url)
+
+        # SQLite
+        if db_url.startswith("sqlite"):
+            connect_args = {
+                "check_same_thread": False,
+                "detect_types": sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+            }
+        # PostgreSQL (Neon)
+        else:
+            connect_args = {"options": "-c search_path=public"}
 
         _engine = create_engine(
             db_url,
@@ -83,6 +92,8 @@ def get_engine() -> Engine:
             future=True,
             connect_args=connect_args,
             pool_pre_ping=True,
+            pool_size=1,
+            max_overflow=0,
         )
 
         _SessionLocal = sessionmaker(
