@@ -24,6 +24,9 @@ from db.connection import get_session
 from db.models import User
 from app.ui import dashboard, processos, prazos, agendamentos, andamentos, financeiro
 from app.ui.theme import inject_global_css
+from pathlib import Path
+
+Path("data").mkdir(parents=True, exist_ok=True)
 
 
 load_dotenv()

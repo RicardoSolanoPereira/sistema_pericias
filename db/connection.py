@@ -4,13 +4,23 @@ import os
 import sqlite3
 from typing import Optional
 
+from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
 def get_db_url() -> str:
-    return os.getenv("DB_URL", "sqlite:///data/app.db")
+    # 1) Se vier do ambiente/secrets, usa
+    env_url = os.getenv("DB_URL")
+    if env_url:
+        return env_url
+
+    # 2) Fallback: sqlite em caminho absoluto dentro do repositório
+    repo_root = Path(__file__).resolve().parent.parent  # .../sistema_pericias
+    db_path = repo_root / "data" / "app.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{db_path.as_posix()}"
 
 
 class Base(DeclarativeBase):
