@@ -10,22 +10,27 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
+# ===============================
+# DATABASE URL
+# ===============================
+
+
 def get_db_url() -> str:
     """
     Ordem de prioridade:
-    1) Streamlit Secrets (Cloud)
-    2) Variável de ambiente DB_URL
-    3) Fallback SQLite local
+    1) Streamlit Secrets
+    2) Variável de ambiente
+    3) SQLite local (fallback)
     """
 
-    # 1️⃣ Streamlit Secrets (Cloud)
+    # 1️⃣ Streamlit Secrets
     try:
         import streamlit as st
 
         if "DB_URL" in st.secrets:
-            db_url = str(st.secrets["DB_URL"]).strip()
-            if db_url:
-                return db_url
+            url = str(st.secrets["DB_URL"]).strip()
+            if url:
+                return url
     except Exception:
         pass
 
@@ -34,7 +39,7 @@ def get_db_url() -> str:
     if env_url and env_url.strip():
         return env_url.strip()
 
-    # 3️⃣ Fallback SQLite local
+    # 3️⃣ SQLite fallback
     repo_root = Path(__file__).resolve().parent.parent
     db_path = repo_root / "data" / "app.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,11 +47,20 @@ def get_db_url() -> str:
     return f"sqlite:///{db_path.as_posix()}"
 
 
+# ===============================
+# BASE
+# ===============================
+
+
 class Base(DeclarativeBase):
     pass
 
 
-# Ativa foreign keys no SQLite
+# ===============================
+# SQLITE PRAGMA
+# ===============================
+
+
 @event.listens_for(Engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, connection_record):
     try:
@@ -57,17 +71,12 @@ def _set_sqlite_pragma(dbapi_connection, connection_record):
         pass
 
 
+# ===============================
+# ENGINE / SESSION
+# ===============================
+
 _engine: Optional[Engine] = None
 _SessionLocal = None
-
-
-def _build_connect_args(db_url: str) -> dict:
-    if db_url.startswith("sqlite"):
-        return {
-            "check_same_thread": False,
-            "detect_types": sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
-        }
-    return {}
 
 
 def get_engine() -> Engine:
@@ -76,25 +85,39 @@ def get_engine() -> Engine:
     if _engine is None:
         db_url = get_db_url()
 
-        # SQLite
+        # --------------------------
+        # SQLITE
+        # --------------------------
         if db_url.startswith("sqlite"):
             connect_args = {
                 "check_same_thread": False,
                 "detect_types": sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
             }
-        # PostgreSQL (Neon)
-        else:
-            connect_args = {"options": "-c search_path=public"}
 
-        _engine = create_engine(
-            db_url,
-            echo=False,
-            future=True,
-            connect_args=connect_args,
-            pool_pre_ping=True,
-            pool_size=1,
-            max_overflow=0,
-        )
+            _engine = create_engine(
+                db_url,
+                echo=False,
+                future=True,
+                connect_args=connect_args,
+            )
+
+        # --------------------------
+        # POSTGRESQL (NEON)
+        # --------------------------
+        else:
+            # IMPORTANTE:
+            # Não coloque sslmode na URL
+            # Use apenas connect_args
+
+            _engine = create_engine(
+                db_url,
+                echo=False,
+                future=True,
+                pool_pre_ping=True,
+                pool_size=1,
+                max_overflow=0,
+                connect_args={"sslmode": "require"},
+            )
 
         _SessionLocal = sessionmaker(
             bind=_engine,
