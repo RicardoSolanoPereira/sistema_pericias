@@ -5,7 +5,9 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from sqlalchemy import select
-from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 
 from .connection import get_engine, get_session, Base
 from .models import User, Feriado
@@ -45,29 +47,48 @@ def _upsert_feriado(
     fonte: str | None,
 ) -> None:
     """
-    UPSERT robusto para SQLite (não estoura UNIQUE):
-    - Se (data, escopo, local) não existir: INSERT
-    - Se existir: UPDATE descricao/fonte/created_at
+    UPSERT compatível com SQLite e Postgres:
+    - SQLite: ON CONFLICT com index_elements
+    - Postgres: ON CONFLICT usando a constraint uq_feriados_data_escopo_local
     """
-    stmt = (
-        insert(Feriado)
-        .values(
-            data=data_dt,
-            escopo=escopo,
-            local=local,
-            descricao=descricao,
-            fonte=fonte,
-            created_at=datetime.utcnow(),
-        )
-        .on_conflict_do_update(
-            index_elements=["data", "escopo", "local"],
-            set_={
-                "descricao": descricao,
-                "fonte": fonte,
-                "created_at": datetime.utcnow(),
-            },
-        )
+    dialect = s.get_bind().dialect.name
+
+    base = dict(
+        data=data_dt,
+        escopo=escopo,
+        local=local,
+        descricao=descricao,
+        fonte=fonte,
+        created_at=datetime.utcnow(),
     )
+
+    if dialect == "postgresql":
+        stmt = (
+            pg_insert(Feriado)
+            .values(**base)
+            .on_conflict_do_update(
+                constraint="uq_feriados_data_escopo_local",
+                set_={
+                    "descricao": descricao,
+                    "fonte": fonte,
+                    "created_at": datetime.utcnow(),
+                },
+            )
+        )
+    else:
+        stmt = (
+            sqlite_insert(Feriado)
+            .values(**base)
+            .on_conflict_do_update(
+                index_elements=["data", "escopo", "local"],
+                set_={
+                    "descricao": descricao,
+                    "fonte": fonte,
+                    "created_at": datetime.utcnow(),
+                },
+            )
+        )
+
     s.execute(stmt)
 
 
@@ -130,16 +151,21 @@ def init_db(seed_feriados: bool = True, ano_seed: int | None = None) -> None:
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
 
-    default_email = os.getenv("DEFAULT_USER_EMAIL", "admin@local")
-    default_name = os.getenv("DEFAULT_USER_NAME", "Admin Local")
+    default_email = os.getenv("DEFAULT_USER_EMAIL", "admin@local").strip()
+    default_name = os.getenv("DEFAULT_USER_NAME", "Admin Local").strip()
 
+    # Seed do usuário default (idempotente) com proteção contra corrida
     with get_session() as s:
-        exists = s.execute(
-            select(User).where(User.email == default_email)
-        ).scalar_one_or_none()
-        if not exists:
-            s.add(User(name=default_name, email=default_email))
-            s.commit()
+        try:
+            exists = s.execute(
+                select(User).where(User.email == default_email)
+            ).scalar_one_or_none()
+            if not exists:
+                s.add(User(name=default_name, email=default_email))
+                s.commit()
+        except IntegrityError:
+            # outro processo/worker pode ter criado o mesmo email ao mesmo tempo
+            s.rollback()
 
     if seed_feriados:
         ano = ano_seed or datetime.utcnow().year
