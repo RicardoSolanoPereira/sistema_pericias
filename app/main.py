@@ -1,12 +1,8 @@
 # app/main.py
+from __future__ import annotations
+
 import os
 import sys
-
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
-
-
 import json
 import subprocess
 import sqlite3
@@ -18,22 +14,30 @@ from typing import Optional
 import streamlit as st
 from dotenv import load_dotenv
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
+# ------------------------------------------------------------
+# PATH / IMPORT FIX (root)
+# ------------------------------------------------------------
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+# ------------------------------------------------------------
+# APP IMPORTS
+# ------------------------------------------------------------
 from db.init_db import init_db
 from db.connection import get_session
 from db.models import User
 from app.ui import dashboard, processos, prazos, agendamentos, andamentos, financeiro
 from app.ui.theme import inject_global_css
-from pathlib import Path
 
+# ------------------------------------------------------------
+# STREAMLIT CONFIG
+# ------------------------------------------------------------
 Path("data").mkdir(parents=True, exist_ok=True)
 
-
 load_dotenv()
-BUILD_ID = "2026-02-28-DEF-1"
-st.sidebar.success(f"BUILD: {BUILD_ID}")
-# init_db()
-
 
 st.set_page_config(
     page_title="Gestão Técnica",
@@ -42,22 +46,68 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+BUILD_ID = "2026-02-28-DEF-1"
+st.sidebar.success(f"BUILD: {BUILD_ID}")
+
+# ✅ CRIA TABELAS SE NÃO EXISTIREM (Postgres/Neon no Cloud)
+init_db()
+
 inject_global_css()
 
-DEFAULT_EMAIL = os.getenv("DEFAULT_USER_EMAIL", "admin@local")
+# ------------------------------------------------------------
+# DEFAULT USER (BOOTSTRAP)
+# ------------------------------------------------------------
+DEFAULT_EMAIL = os.getenv("DEFAULT_USER_EMAIL", "admin@local").strip()
+DEFAULT_NAME = os.getenv("DEFAULT_USER_NAME", "Administrador").strip()
 
 
-@st.cache_data(show_spinner=False)
-def get_owner_user_id(default_email: str) -> int:
+def get_or_create_owner_user_id(default_email: str, default_name: str) -> int:
+    """
+    Busca usuário pelo email.
+    Se não existir, cria e retorna o id.
+
+    - Faz commit apenas quando cria.
+    - Faz rollback em qualquer erro.
+    - Trata corrida (IntegrityError) caso duas execuções criem ao mesmo tempo.
+    """
     with get_session() as s:
-        user = (
-            s.execute(select(User).where(User.email == default_email)).scalars().first()
-        )
-        if not user:
-            raise RuntimeError(
-                "Usuário default não encontrado. Rode: python -m db.init_db"
+        try:
+            user = (
+                s.execute(select(User).where(User.email == default_email))
+                .scalars()
+                .first()
             )
-        return user.id
+            if user:
+                return user.id
+
+            user = User(name=default_name, email=default_email)
+            s.add(user)
+            s.commit()
+            s.refresh(user)
+            return user.id
+
+        except IntegrityError:
+            # corrida: outro worker criou o mesmo email
+            s.rollback()
+            user = (
+                s.execute(select(User).where(User.email == default_email))
+                .scalars()
+                .first()
+            )
+            if not user:
+                raise
+            return user.id
+
+        except Exception:
+            s.rollback()
+            raise
+
+
+try:
+    owner_user_id = get_or_create_owner_user_id(DEFAULT_EMAIL, DEFAULT_NAME)
+except Exception as e:
+    st.error(f"Falha ao inicializar usuário padrão: {type(e).__name__}: {e}")
+    st.stop()
 
 
 # -------------------------
@@ -194,16 +244,6 @@ def _build_backup_state(last: dict | None) -> BackupState:
 
 
 # -------------------------
-# BOOTSTRAP USER
-# -------------------------
-try:
-    owner_user_id = get_owner_user_id(DEFAULT_EMAIL)
-except RuntimeError as e:
-    st.error(str(e))
-    st.stop()
-
-
-# -------------------------
 # SIDEBAR
 # -------------------------
 st.sidebar.markdown("## 📐 Gestão Técnica")
@@ -215,7 +255,7 @@ MENU_LABELS = {
     "Processos": "📁 Trabalhos",
     "Prazos": "⏳ Prazos",
     "Agendamentos": "📅 Agenda",
-    "Andamentos": "🧾 Andamentos",  # ✅ renomeado
+    "Andamentos": "🧾 Andamentos",
     "Financeiro": "💰 Financeiro",
 }
 
@@ -297,8 +337,7 @@ with st.sidebar.expander(f"📦 Backup  •  {state.integrity_label}", expanded=
             key="check_integrity_btn",
         ):
             ok, msg = _check_sqlite_integrity(state.path)
-            # Atualiza o manifest existente (sem mexer em script), mantendo padrão simples:
-            # escreve só o que falta
+
             manifest = _backup_manifest_path()
             try:
                 payload = (
@@ -308,6 +347,7 @@ with st.sidebar.expander(f"📦 Backup  •  {state.integrity_label}", expanded=
                 )
             except Exception:
                 payload = {}
+
             payload.update(
                 {
                     "integrity_ok": bool(ok),
@@ -317,8 +357,10 @@ with st.sidebar.expander(f"📦 Backup  •  {state.integrity_label}", expanded=
                     ),
                 }
             )
+
             manifest.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
             st.rerun()
 

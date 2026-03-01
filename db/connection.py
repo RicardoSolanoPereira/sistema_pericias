@@ -110,9 +110,6 @@ def get_engine() -> Engine:
         # POSTGRESQL (NEON)
         # --------------------------
         else:
-            # IMPORTANTE:
-            # - deixe a DB_URL limpa (sem sslmode/channel_binding na URL)
-            # - forçamos SSL e AUTOCOMMIT aqui para evitar "transaction is aborted"
             _engine = create_engine(
                 db_url,
                 echo=False,
@@ -120,11 +117,7 @@ def get_engine() -> Engine:
                 pool_pre_ping=True,
                 pool_size=1,
                 max_overflow=0,
-                connect_args={
-                    "sslmode": "require",
-                    "autocommit": True,
-                },
-                isolation_level="AUTOCOMMIT",
+                connect_args={"sslmode": "require"},
             )
 
         _SessionLocal = sessionmaker(
