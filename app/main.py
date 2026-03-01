@@ -30,7 +30,9 @@ Path("data").mkdir(parents=True, exist_ok=True)
 
 
 load_dotenv()
-init_db()
+BUILD_ID = "2026-02-28-DEF-1"
+st.sidebar.success(f"BUILD: {BUILD_ID}")
+# init_db()
 
 
 st.set_page_config(

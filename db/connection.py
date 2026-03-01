@@ -19,11 +19,11 @@ def get_db_url() -> str:
     """
     Ordem de prioridade:
     1) Streamlit Secrets
-    2) Variável de ambiente
+    2) Variável de ambiente DB_URL
     3) SQLite local (fallback)
     """
 
-    # 1️⃣ Streamlit Secrets
+    # 1) Streamlit Secrets (Cloud)
     try:
         import streamlit as st
 
@@ -34,16 +34,15 @@ def get_db_url() -> str:
     except Exception:
         pass
 
-    # 2️⃣ Variável de ambiente
+    # 2) Variável de ambiente
     env_url = os.getenv("DB_URL")
     if env_url and env_url.strip():
         return env_url.strip()
 
-    # 3️⃣ SQLite fallback
-    repo_root = Path(__file__).resolve().parent.parent
+    # 3) Fallback SQLite local
+    repo_root = Path(__file__).resolve().parent.parent  # .../sistema_pericias
     db_path = repo_root / "data" / "app.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
-
     return f"sqlite:///{db_path.as_posix()}"
 
 
@@ -57,16 +56,22 @@ class Base(DeclarativeBase):
 
 
 # ===============================
-# SQLITE PRAGMA
+# SQLITE PRAGMA (ONLY SQLITE)
 # ===============================
 
 
 @event.listens_for(Engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, connection_record):
+    """
+    Ativa foreign keys no SQLite.
+    Importante: só executa se a conexão for sqlite3.
+    """
     try:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+        # sqlite3 connections come from module "sqlite3"
+        if dbapi_connection.__class__.__module__.startswith("sqlite3"):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
     except Exception:
         pass
 
@@ -106,9 +111,8 @@ def get_engine() -> Engine:
         # --------------------------
         else:
             # IMPORTANTE:
-            # Não coloque sslmode na URL
-            # Use apenas connect_args
-
+            # - deixe a DB_URL limpa (sem sslmode/channel_binding na URL)
+            # - forçamos SSL e AUTOCOMMIT aqui para evitar "transaction is aborted"
             _engine = create_engine(
                 db_url,
                 echo=False,
@@ -116,7 +120,11 @@ def get_engine() -> Engine:
                 pool_pre_ping=True,
                 pool_size=1,
                 max_overflow=0,
-                connect_args={"sslmode": "require"},
+                connect_args={
+                    "sslmode": "require",
+                    "autocommit": True,
+                },
+                isolation_level="AUTOCOMMIT",
             )
 
         _SessionLocal = sessionmaker(
