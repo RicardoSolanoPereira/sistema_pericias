@@ -1,37 +1,39 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
-*.sqlite3
 
 # Virtualenv
 venv/
-.env/
 .venv/
 
 # Env / secrets
 .env
 .env.*
+!.env.example
 
 # Banco local e backups
-data/
-backups/
 *.db
 *.sqlite
 *.sqlite3
-logs/
 
-# VSCode
-.vscode/
+# Dados operacionais (ignorar tudo, mas manter imports)
+data/*
+!data/imports/
+!data/imports/**
+!data/.gitkeep
 
-# Logs / outputs
+# Backups/logs/outputs fora de data (se ainda existirem)
+backups/
 logs/
 exports/
 uploads/
 
-# Streamlit cache/config (se usar)
-.streamlit/
+# VSCode
+.vscode/
+
+# Streamlit: versiona config, ignora secrets
+.streamlit/secrets.toml
 
 # OS
 .DS_Store

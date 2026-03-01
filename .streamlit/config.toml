@@ -1,0 +1,11 @@
+# .streamlit/config.toml
+[theme]
+base="light"
+
+# Leve suavização (continua executivo, mas menos "preto")
+primaryColor="#1f2937"
+
+backgroundColor="#ffffff"
+secondaryBackgroundColor="#f4f6f8"
+textColor="#0f172a"
+font="sans serif"
